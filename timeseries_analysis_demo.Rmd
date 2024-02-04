@@ -1,0 +1,217 @@
+---
+title: "Time series analysis: wildfire PM2.5 and (synthetic) mortality"
+author: "CAFE Educational Demo"
+output: html_document
+---
+
+### 1. load in packages and set working directory
+
+```{r setup,message=F}
+library(lubridate) ## for easy processing of dates
+library(stringr) ## for easy processing of character variables
+library(ggplot2) ## for plotting
+library(mixmeta) ## for meta-analysis
+library(Epi)
+library(lme4) ## for meta-analysis
+library(gnm) ## for conditional (quasi-)poisson model fitting
+
+```
+
+### 2. data import and processing
+
+```{r dataproc}
+
+## read in the merged data with wildfire pm2.5 and mortality ##
+dat<-read.csv('full_data.csv')
+## make fips codes (GEOID) into a 5-character string (add back leading zero that gets dropped from numeric vars) ##
+dat$GEOID<-stringr::str_pad(dat$GEOID,width=5,side='left',pad='0')
+
+## make month and year variables to account for seasonality and long-term trends ##
+dat$month<-factor(lubridate::month(dat$date))
+dat$year<-lubridate::year(dat$date)
+
+## subset to only May-Oct (wildfire season) ##
+dat<-subset(dat,month %in% 5:10)
+dat$month<-droplevels(dat$month)
+
+## make day of week and weekend variables ##
+dat$dow<-lubridate::wday(dat$date,label = T)
+dat$weekend<-as.numeric(dat$dow %in% c('Sat','Sun'))
+
+## convert the data into a list where each list entry contains the time series for a county ##
+ts_list<-split(dat,dat$GEOID)
+```
+
+
+### 3. site-specific time series model fitting
+
+```{r ts_ss}
+#########################################
+## fit for a single county (LA county) ##
+#########################################
+
+## extract the data for only LA county, GEOID=06037 ##
+datsub<-subset(dat,GEOID=='06037')
+
+## fit the time series model ##
+modfit<-glm(outcome ~ x + weekend + month + year,
+            data=datsub, family=quasipoisson())
+
+## inspect the model output ##
+summary(modfit)
+outtable<-summary(modfit)$coefficients
+logRR<-outtable[2,1] ## extract logRR estimate
+logRRse<-outtable[2,2] ## extract logRR standard error
+print(paste0('Rate ratio=',
+             round(exp(logRR),3), ' (',
+             round(exp(logRR-1.96*logRRse),3),',',
+             round(exp(logRR+1.96*logRRse),3),')'))
+
+#################################
+## fit models for all counties ##
+#################################
+
+## option a: loop through the counties ##
+## vector of unique county identifiers ##
+countyids<-unique(dat$GEOID)
+## empty list to store output ##
+outlist1<-list()
+## start loop ##
+for (i in 1:length(countyids)){
+  ## extract the data for only the given county ##
+  datsub<-subset(dat,GEOID==countyids[i])
+  ## fit the time series model ##
+  modfit<-glm(outcome ~ x + weekend + month + year,
+              data=datsub, family=quasipoisson())
+  ## make an object from the model fit summary object ##
+  sumout<-summary(modfit)
+  ## save model fit coefficient table in the list ##
+  outlist1<-c(outlist1,list(cbind(sumout$coefficients,
+                                  diag(sumout$cov.scaled))))
+}
+## add the county identifiers as the list names ##
+names(outlist1)<-countyids
+
+
+## option b: use lapply on ts_list ##
+outlist2<-lapply(ts_list,FUN=function(datsub){
+  modfit<-glm(outcome ~ x + weekend + month + year,
+              data=datsub, family=quasipoisson())
+  sumout<-summary(modfit)
+  cbind(sumout$coefficients,
+        diag(sumout$cov.scaled))
+})
+
+## extract the logRRs, standard errors, and variances for wildfire PM2.5 for each county ##
+logRRs<-t(sapply(outlist2, FUN=function(modout) {modout[2,c(1:2,5)]}))
+logRRs<-data.frame(rownames(logRRs),logRRs)
+names(logRRs)<-c('countyID','logRRest','logRRse','logRRvar')
+
+## export the results to a csv file ##
+write.csv(logRRs,file='time_series_results_SS.csv',row.names = F)
+```
+
+### 4. plot the results
+
+```{r plot1,fig.height=7}
+
+## read in the csv ##
+ggplotdat<-read.csv('time_series_results_SS.csv')
+ggplotdat$countyID<-stringr::str_pad(ggplotdat$countyID,width=5,side='left',pad='0')
+
+## make a plot of county-specific RRs and 95% CIs ##
+ggplotdat$RR<-exp(ggplotdat$logRRest)
+ggplotdat$ll<-exp(ggplotdat$logRRest-1.96*ggplotdat$logRRse)
+ggplotdat$ul<-exp(ggplotdat$logRRest+1.96*ggplotdat$logRRse)
+
+ggplot(ggplotdat, aes(x=RR, y=countyID)) + 
+  geom_errorbar(aes(xmin=ul, xmax=ll), colour="black") +
+  geom_point(size=2)+
+  geom_vline(xintercept = 1)+
+  theme_bw()
+
+## investigate what's going on with county 06003 (small population, unstable outcome) ##
+summary(dat$outcome[which(dat$GEOID=='06003')])
+plot(1:length(dat$outcome[which(dat$GEOID=='06003')]),
+     dat$outcome[which(dat$GEOID=='06003')],type='l',
+     xlab='day of study',ylab='mortality count')
+
+```
+
+### 5. meta-analysis of results
+
+```{r meta,fig.height=7}
+
+meta_WF <- mixmeta(logRRest, logRRvar, data=logRRs, method="ml")
+
+# RESULTS
+print(summary(meta_WF), digits=4, report="var")
+print(ci.exp(meta_WF), digits=4)
+
+# Influence of countyID 06003 in overall estimation
+# Try removing?
+logRRs_check<-logRRs[logRRs$countyID!='06003', 1:4]
+meta_WF_2 <- mixmeta(logRRest, logRRvar, data=logRRs_check, method="ml")
+
+# RESULTS
+print(summary(meta_WF_2), digits=4, report="var")
+print(ci.exp(meta_WF_2), digits=4)
+
+
+## add the meta-analysis results to the RR and CI plot ##
+outtable<-summary(meta_WF)$coefficients
+meta_results<-data.frame('Meta',outtable[1,1],outtable[1,2],outtable[1,2]^2,
+                         exp(outtable[1,1]),exp(outtable[1,1]-1.96*outtable[1,2]),
+                         exp(outtable[1,1]+1.96*outtable[1,2]))
+names(meta_results)<-names(ggplotdat)
+ggplotdat<-rbind(ggplotdat,meta_results)
+
+## remake plot ##
+ggplot(ggplotdat, aes(x=RR, y=countyID)) + 
+  geom_errorbar(aes(xmin=ul, xmax=ll), colour="black") +
+  geom_point(size=2)+
+  geom_vline(xintercept = 1)+
+  theme_bw()
+```
+
+### 6. conditional (quasi-)poisson model
+
+```{r condition}
+
+## extract the data for only LA county, GEOID=06037 ##
+datsub<-subset(dat,GEOID=='06037')
+
+## add a 'week+year' stratum indicator ##
+datsub$studyweek<-factor(paste0(datsub$year,lubridate::week(datsub$date)))
+
+## fit for LA county only ##
+cqp_modfit<-gnm(outcome ~ x + weekend,
+                family=quasipoisson(), data=datsub, eliminate=studyweek)
+
+## inspect output ##
+summary(cqp_modfit)
+outtable<-summary(cqp_modfit)$coefficients
+logRR<-outtable[1,1] ## extract logRR estimate (note that now it's in the first row b/c no intercept estimated)
+logRRse<-outtable[1,2] ## extract logRR standard error
+print(paste0('Conditional quasi-poisson rate ratio=',
+             round(exp(logRR),3), ' (',
+             round(exp(logRR-1.96*logRRse),3),',',
+             round(exp(logRR+1.96*logRRse),3),')'))
+
+## confirm that estimate and standard error for exposure are same as from 
+## poisson regression adjusted for stratum ##
+qp_modfit<-glm(outcome ~ x + weekend + studyweek,
+               data=datsub, family=quasipoisson())
+
+## inspect output ##
+#summary(qp_modfit)
+outtable<-summary(qp_modfit)$coefficients
+logRR<-outtable[2,1] ## extract logRR estimate
+logRRse<-outtable[2,2] ## extract logRR standard error
+print(paste0('Study week-adjusted quasi-poisson rate ratio=',
+             round(exp(logRR),3), ' (',
+             round(exp(logRR-1.96*logRRse),3),',',
+             round(exp(logRR+1.96*logRRse),3),')'))
+
+```
+
